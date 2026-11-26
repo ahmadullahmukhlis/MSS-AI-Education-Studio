@@ -46,51 +46,69 @@ jobs:
               cleaners.pashto_grapheme_cleaners = pashto_grapheme_cleaners
           assert callable(cleaners.pashto_grapheme_cleaners)
           assert "پښتو" in cleaners.pashto_grapheme_cleaners("  پښتو  ")
-          from TTS.tts.utils import managers
           from TTS.api import TTS
           import json
           import inspect
+          import torch
+          import numbers
 
-          # The published config may retain training-machine paths.
-          # Repair the final config actually passed to Coqui, including nested args.
           original_init = TTS.__init__
           def patched_init(self, *args, **kwargs):
               bound = inspect.signature(original_init).bind(self, *args, **kwargs)
-              config_path = bound.arguments.get("config_path")
-              if config_path:
-                  root = Path("model").resolve()
-                  config = json.loads(Path(config_path).read_text(encoding="utf-8"))
-                  paths = {
-                      "d_vector_file": "speakers.pth",
-                      "speakers_file": "speakers.pth",
-                      "speaker_encoder_model_path": "model_se.pth",
-                      "speaker_encoder_config_path": "config_se.json",
-                  }
-                  for name, filename in paths.items():
-                      target = root / filename
-                      assert target.is_file(), target
-                      config[name] = str(target)
-                      config.setdefault("model_args", {})[name] = str(target)
-                  config["output_path"] = str(root)
-                  config["datasets"] = []
-                  runtime = root / "_mss_runtime_config.json"
-                  runtime.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-                  bound.arguments["config_path"] = str(runtime)
-                  print("Resolved embedding:", config["model_args"]["d_vector_file"], flush=True)
+              root = Path("model").resolve()
+              config = json.loads(Path(bound.arguments["config_path"]).read_text(encoding="utf-8"))
+              # The release contains an ID map, not necessarily a d-vector map.
+              speaker_path = root / "speakers.pth"
+              speakers = torch.load(speaker_path, map_location="cpu", weights_only=True)
+              assert isinstance(speakers, dict) and speakers, "Empty or invalid speaker map"
+              id_map = all(isinstance(v, numbers.Integral) for v in speakers.values())
+              vector_map = all(isinstance(v, dict) and "name" in v and "embedding" in v for v in speakers.values())
+              print("Speaker map type:", "IDs" if id_map else "vectors" if vector_map else "unknown", flush=True)
+              # Inspect checkpoint architecture on CPU before selecting conditioning.
+              checkpoint = torch.load(root / "best_model.pth", map_location="cpu", weights_only=True)
+              state = checkpoint.get("model", checkpoint)
+              learned = [(k, v) for k, v in state.items() if k.endswith("emb_g.weight") and isinstance(v, torch.Tensor)]
+              print("Learned speaker embedding shapes:", [(k, tuple(v.shape)) for k,v in learned], flush=True)
+              model_args = config.setdefault("model_args", {})
+              def set_both(key, value):
+                  config[key] = value
+                  model_args[key] = value
+              set_both("speaker_encoder_model_path", str(root / "model_se.pth"))
+              set_both("speaker_encoder_config_path", str(root / "config_se.json"))
+              if id_map and learned:
+                  rows, channels = learned[0][1].shape
+                  assert min(speakers.values()) >= 0 and max(speakers.values()) < rows
+                  set_both("use_speaker_embedding", True)
+                  set_both("use_d_vector_file", False)
+                  set_both("d_vector_file", None)
+                  set_both("speakers_file", str(speaker_path))
+                  set_both("num_speakers", rows)
+                  set_both("speaker_embedding_channels", channels)
+              else:
+                  # Find genuine external vectors, including any embedded in the checkpoint.
+                  candidates = []
+                  if vector_map:
+                      candidates.append(speakers)
+                  for key in ("d_vectors", "speaker_embeddings", "speaker_manager", "speakers"):
+                      value = checkpoint.get(key)
+                      if isinstance(value, dict) and value and all(isinstance(v, dict) and "name" in v and "embedding" in v for v in value.values()):
+                          candidates.append(value)
+                  if not candidates:
+                      raise RuntimeError("The published speaker file contains IDs but the checkpoint has no learned speaker table or usable d-vectors. Obtain the original d-vector file from the model author; cannot synthesize the selected speaker from IDs alone.")
+                  vectors = root / "_mss_d_vectors.pth"
+                  torch.save(candidates[0], vectors)
+                  set_both("use_speaker_embedding", False)
+                  set_both("use_d_vector_file", True)
+                  set_both("d_vector_file", [str(vectors)])
+                  set_both("speakers_file", str(speaker_path))
+              del checkpoint, state, learned
+              config["output_path"] = str(root)
+              config["datasets"] = []
+              runtime = root / "_mss_runtime_config.json"
+              runtime.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+              bound.arguments["config_path"] = str(runtime)
               return original_init(*bound.args, **bound.kwargs)
           TTS.__init__ = patched_init
-
-          original_load = managers.load_file
-          def checked_load(path, *args, **kwargs):
-              print("Coqui embedding loader path:", repr(path), flush=True)
-              # Coqui expects an individual .pth/.json file, not a stale training path.
-              if not str(path).endswith((".pth", ".json")):
-                  target = Path("model/speakers.pth").resolve()
-                  if not target.is_file():
-                      raise FileNotFoundError(target)
-                  path = str(target)
-              return original_load(path, *args, **kwargs)
-          managers.load_file = checked_load
 
           helper = Path("model/hf_infer_pashto_ghag_yourtts.py").resolve()
           sys.path.insert(0, str(helper.parent))
