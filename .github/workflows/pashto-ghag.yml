@@ -1,0 +1,53 @@
+name: Pashto Ghag lecturer sample
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/pashto-ghag.yml'
+permissions:
+  contents: read
+jobs:
+  speech:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install CPU inference dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libsndfile1 espeak-ng
+          python -m pip install --upgrade pip
+          pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install 'TTS==0.22.0' 'transformers<4.50' 'huggingface_hub<1' 'numpy<2'
+      - name: Download public model
+        run: |
+          python -c "from huggingface_hub import snapshot_download; snapshot_download('Nasimbahar/pashto-ghag-yourtts', local_dir='model', allow_patterns=['*.pth','*.json','*.py','*.md'])"
+      - name: Generate Pashto lecturer example
+        shell: bash
+        run: |
+          mkdir -p out
+          sentences=(
+            'السلام علیکم ګرانو زده کوونکو! زموږ د فلاتر د زده کړې لړۍ ته ښه راغلاست.'
+            'نن به په عملي ډول زده کړو چې فلاتر څه شی دی او څنګه کولای شو د موبایل لپاره یوه ساده اپلېکېشن جوړه کړو.'
+            'فلاتر موږ ته دا اسانتیا راکوي چې د یوه کوډ په وسیله د بېلابېلو وسیلو لپاره اپلېکېشن جوړ کړو.'
+            'لومړی به یوه نوې پروژه جوړه کړو. بیا به د هغې جوړښت او د کوډ هره برخه په ګډه وڅېړو.'
+            'که تاسې له پروګرامینګ سره تازه بلد شوي یاست، اندېښنه مه کوئ. هر مثال به په ساده ژبه او ګام په ګام تشریح کړو.'
+          )
+          for i in "${!sentences[@]}"; do
+            python model/hf_infer_pashto_ghag_yourtts.py --model-dir model --text "${sentences[$i]}" --speaker-id speaker_01_nasim_bahar --output-wav "out/part-$i.wav"
+            ffmpeg -v error -y -i "out/part-$i.wav" -ar 22050 -ac 1 -c:a pcm_s16le "out/segment-$i.wav"
+            printf "file 'segment-%s.wav'\n" "$i" >> out/concat.txt
+          done
+          ffmpeg -v error -y -f concat -safe 0 -i out/concat.txt -af 'highpass=f=70,loudnorm=I=-16:TP=-1.5:LRA=11' -ar 48000 -c:a libmp3lame -b:a 192k out/pashto-lecturer.mp3
+          ffprobe -v error -show_format -show_streams out/pashto-lecturer.mp3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pashto-ghag-lecturer
+          path: out/pashto-lecturer.mp3
+          if-no-files-found: error
+          retention-days: 7
