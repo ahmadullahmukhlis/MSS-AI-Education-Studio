@@ -46,6 +46,52 @@ jobs:
               cleaners.pashto_grapheme_cleaners = pashto_grapheme_cleaners
           assert callable(cleaners.pashto_grapheme_cleaners)
           assert "پښتو" in cleaners.pashto_grapheme_cleaners("  پښتو  ")
+          from TTS.tts.utils import managers
+          from TTS.api import TTS
+          import json
+          import inspect
+
+          # The published config may retain training-machine paths.
+          # Repair the final config actually passed to Coqui, including nested args.
+          original_init = TTS.__init__
+          def patched_init(self, *args, **kwargs):
+              bound = inspect.signature(original_init).bind(self, *args, **kwargs)
+              config_path = bound.arguments.get("config_path")
+              if config_path:
+                  root = Path("model").resolve()
+                  config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                  paths = {
+                      "d_vector_file": "speakers.pth",
+                      "speakers_file": "speakers.pth",
+                      "speaker_encoder_model_path": "model_se.pth",
+                      "speaker_encoder_config_path": "config_se.json",
+                  }
+                  for name, filename in paths.items():
+                      target = root / filename
+                      assert target.is_file(), target
+                      config[name] = str(target)
+                      config.setdefault("model_args", {})[name] = str(target)
+                  config["output_path"] = str(root)
+                  config["datasets"] = []
+                  runtime = root / "_mss_runtime_config.json"
+                  runtime.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+                  bound.arguments["config_path"] = str(runtime)
+                  print("Resolved embedding:", config["model_args"]["d_vector_file"], flush=True)
+              return original_init(*bound.args, **bound.kwargs)
+          TTS.__init__ = patched_init
+
+          original_load = managers.load_file
+          def checked_load(path, *args, **kwargs):
+              print("Coqui embedding loader path:", repr(path), flush=True)
+              # Coqui expects an individual .pth/.json file, not a stale training path.
+              if not str(path).endswith((".pth", ".json")):
+                  target = Path("model/speakers.pth").resolve()
+                  if not target.is_file():
+                      raise FileNotFoundError(target)
+                  path = str(target)
+              return original_load(path, *args, **kwargs)
+          managers.load_file = checked_load
+
           helper = Path("model/hf_infer_pashto_ghag_yourtts.py").resolve()
           sys.path.insert(0, str(helper.parent))
           sys.argv[0] = str(helper)
@@ -63,7 +109,7 @@ jobs:
             'که تاسې له پروګرامینګ سره تازه بلد شوي یاست، اندېښنه مه کوئ. هر مثال به په ساده ژبه او ګام په ګام تشریح کړو.'
           )
           for i in "${!sentences[@]}"; do
-            python ghag_infer.py --model-dir model --text "${sentences[$i]}" --speaker-id speaker_01_nasim_bahar --output-wav "out/part-$i.wav"
+            python ghag_infer.py --model-dir "$PWD/model" --text "${sentences[$i]}" --speaker-id speaker_01_nasim_bahar --output-wav "out/part-$i.wav"
             ffmpeg -v error -y -i "out/part-$i.wav" -ar 22050 -ac 1 -c:a pcm_s16le "out/segment-$i.wav"
             printf "file 'segment-%s.wav'\n" "$i" >> out/concat.txt
           done
