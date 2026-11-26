@@ -27,6 +27,30 @@ jobs:
       - name: Download public model
         run: |
           python -c "from huggingface_hub import snapshot_download; snapshot_download('Nasimbahar/pashto-ghag-yourtts', local_dir='model', allow_patterns=['*.pth','*.json','*.py','*.md'])"
+      - name: Register missing Pashto grapheme cleaner
+        run: |
+          cat > ghag_infer.py <<'PY'
+          import re
+          import runpy
+          import sys
+          import unicodedata
+          from pathlib import Path
+          from TTS.tts.utils.text import cleaners
+
+          def pashto_grapheme_cleaners(text):
+              text = unicodedata.normalize("NFC", text)
+              return re.sub(r"\s+", " ", text).strip()
+
+          # Preserve an upstream implementation if a future TTS version includes it.
+          if not hasattr(cleaners, "pashto_grapheme_cleaners"):
+              cleaners.pashto_grapheme_cleaners = pashto_grapheme_cleaners
+          assert callable(cleaners.pashto_grapheme_cleaners)
+          assert "پښتو" in cleaners.pashto_grapheme_cleaners("  پښتو  ")
+          helper = Path("model/hf_infer_pashto_ghag_yourtts.py").resolve()
+          sys.path.insert(0, str(helper.parent))
+          sys.argv[0] = str(helper)
+          runpy.run_path(str(helper), run_name="__main__")
+          PY
       - name: Generate Pashto lecturer example
         shell: bash
         run: |
@@ -39,7 +63,7 @@ jobs:
             'که تاسې له پروګرامینګ سره تازه بلد شوي یاست، اندېښنه مه کوئ. هر مثال به په ساده ژبه او ګام په ګام تشریح کړو.'
           )
           for i in "${!sentences[@]}"; do
-            python model/hf_infer_pashto_ghag_yourtts.py --model-dir model --text "${sentences[$i]}" --speaker-id speaker_01_nasim_bahar --output-wav "out/part-$i.wav"
+            python ghag_infer.py --model-dir model --text "${sentences[$i]}" --speaker-id speaker_01_nasim_bahar --output-wav "out/part-$i.wav"
             ffmpeg -v error -y -i "out/part-$i.wav" -ar 22050 -ac 1 -c:a pcm_s16le "out/segment-$i.wav"
             printf "file 'segment-%s.wav'\n" "$i" >> out/concat.txt
           done
